@@ -10,8 +10,7 @@ import { useFirestore } from './hooks/useFirestore';
 import { useDarkMode } from './hooks/useDarkMode';
 import ShareOptions from './components/ShareOptions';
 import LotteryNumbers from './components/LotteryNumbers';
-import * as tf from '@tensorflow/tfjs';
-import * as mobilenet from '@tensorflow-models/mobilenet';
+// TensorFlow.js와 MobileNet 임포트 제거 (Worker에서 사용)
 
 const App = () => {
   const [image, setImage] = useState(null);
@@ -19,7 +18,6 @@ const App = () => {
   const [error, setError] = useState(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [model, setModel] = useState(null);
   const [isModelLoading, setIsModelLoading] = useState(true);
   const [isModelReady, setIsModelReady] = useState(false);
   const [modelLoadingProgress, setModelLoadingProgress] = useState(0);
@@ -30,58 +28,59 @@ const App = () => {
   const [lotteryType, setLotteryType] = useState('lotto');
   const [infoMessage, setInfoMessage] = useState(null);
   const fileInputRef = useRef(null);
+  const [worker, setWorker] = useState(null); // 새로운 state: Web Worker 참조
 
   const { user, login, logout } = useAuth();
   const { fetchRecords, addRecord, records } = useFirestore(user);
   const { isDarkMode, toggleDarkMode } = useDarkMode();
   
   useEffect(() => {
-    const loadModel = async () => {
-      console.log('모델 로딩 프로세스 시작');
-      try {
-        setIsModelLoading(true);
-        console.log('TensorFlow.js 초기화 시작');
-        await tf.ready();
-        console.log('TensorFlow.js 초기화 완료');
-        setModelLoadingProgress(10);
-
-        console.log('MobileNet 모델 로딩 시작');
-        const mobilenetModel = await mobilenet.load({
-          version: 2,
-          alpha: 1.0,
-        }, (progress) => {
-          const currentProgress = 10 + progress * 80;
-          console.log(`MobileNet 모델 로딩 진행률: ${currentProgress.toFixed(2)}%`);
-          setModelLoadingProgress(currentProgress);
-        });
-        console.log('MobileNet 모델 로딩 완료');
-        setModelLoadingProgress(90);
-
-        console.log('모델 초기화 및 웜업 시작');
-        const sampleImageTensor = tf.zeros([1, 224, 224, 3]);
-        await mobilenetModel.classify(sampleImageTensor);
-        sampleImageTensor.dispose();
-        console.log('모델 초기화 및 웜업 완료');
-
-        setModel(mobilenetModel);
+    console.log('Worker 초기화 시작');
+  
+    // WebGL 지원 확인
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+    if (gl) {
+      console.log('WebGL 지원됨');
+    } else {
+      console.error('WebGL이 지원되지 않습니다. 모델 로딩에 문제가 발생할 수 있습니다.');
+    }
+  
+    const modelWorker = new Worker('/modelWorker.js');
+    setWorker(modelWorker);
+  
+    modelWorker.onmessage = (event) => {
+      console.log('Worker로부터 메시지 수신:', event.data);
+      if (event.data.type === 'loaded') {
+        console.log('모델 로딩 완료');
         setIsModelReady(true);
         setIsModelLoading(false);
         setModelLoadingProgress(100);
-        console.log('모델 로딩 프로세스 완료. 모델 사용 준비 완료.');
-      } catch (error) {
-        console.error('모델 로딩 실패. 상세 오류:', error);
-        console.error('오류 스택:', error.stack);
+      } else if (event.data.type === 'progress') {
+        console.log('모델 로딩 진행률:', event.data.progress);
+        setModelLoadingProgress(event.data.progress);
+      } else if (event.data.type === 'error') {
+        console.error('Worker 에러:', event.data.error);
         setError('모델 로딩에 실패했습니다. 페이지를 새로고침하거나 잠시 후 다시 시도해주세요.');
         setIsModelLoading(false);
         setModelLoadingProgress(0);
+      } else if (event.data.type === 'tfVersion') {
+        console.log('TensorFlow.js 버전:', event.data.version);
       }
     };
-
-    console.log('모델 로딩 함수 호출');
-    loadModel();
-
+  
+    modelWorker.onerror = (error) => {
+      console.error('Worker 에러 발생:', error);
+      setError('Worker 초기화 중 오류가 발생했습니다. 페이지를 새로고침해 주세요.');
+      setIsModelLoading(false);
+    };
+  
+    console.log('모델 로딩 시작 메시지 전송');
+    modelWorker.postMessage({ type: 'load' });
+  
     return () => {
-      console.log('컴포넌트 언마운트. 필요시 모델 정리 로직 실행.');
+      console.log('Worker 종료');
+      modelWorker.terminate();
     };
   }, []);
 
@@ -98,7 +97,7 @@ const App = () => {
     console.log('번호 생성 프로세스 시작');
     console.log('현재 선택된 복권 타입:', lotteryType);
     
-    if (!isModelReady) {
+    if (!isModelReady || !worker) {
       console.error('모델이 아직 준비되지 않음. 현재 모델 상태:', { isModelReady, isModelLoading });
       setError('모델이 아직 준비되지 않았습니다. 잠시 후 다시 시도해주세요.');
       return;
@@ -119,16 +118,45 @@ const App = () => {
       } else {
         console.log('로또 번호 생성 시작');
         const img = new Image();
-        await new Promise((resolve, reject) => {
+        const imageLoadPromise = new Promise((resolve, reject) => {
           img.onload = resolve;
           img.onerror = reject;
           img.src = URL.createObjectURL(file);
         });
   
-        const tfImg = tf.browser.fromPixels(img);
-        const results = await model.classify(tfImg);
+        await imageLoadPromise;
+  
+        // 이미지 리사이징
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = 224;  // MobileNet 입력 크기
+        canvas.height = 224;
+        ctx.drawImage(img, 0, 0, img.width, img.height, 0, 0, 224, 224);
+        
+        const imageData = ctx.getImageData(0, 0, 224, 224);
+  
+        // Worker에 이미지 데이터 전송
+        worker.postMessage({ 
+          type: 'classify', 
+          imageData: new Uint8Array(imageData.data),
+          width: imageData.width,
+          height: imageData.height
+        });
+  
+        // Worker로부터 결과 기다리기
+        const results = await new Promise((resolve, reject) => {
+          worker.onmessage = (event) => {
+            if (event.data.type === 'results') {
+              resolve(event.data.results);
+            } else if (event.data.type === 'error') {
+              reject(new Error(event.data.error));
+            }
+          };
+        });
+  
         console.log('이미지 분류 완료. 결과:', results);
   
+        // 이미지 분류 결과를 바탕으로 번호 생성
         const hash = results.slice(0, 3).map(r => r.className).join(',');
         const numbers = [];
         for (let i = 0; i < 6; i++) {
@@ -143,8 +171,6 @@ const App = () => {
         }
   
         generatedNumbers = uniqueNumbers.slice(0, 6).sort((a, b) => a - b);
-        
-        tfImg.dispose();
       }
       
       console.log('생성된 번호:', generatedNumbers);
@@ -170,7 +196,7 @@ const App = () => {
       setError('번호 생성 중 오류가 발생했습니다. 다시 시도해주세요.');
       setIsGenerating(false);
     }
-  }, [lotteryType, isModelReady, model, user, addRecord]);
+  }, [lotteryType, isModelReady, worker, user, addRecord]);
 
   const InfoMessage = ({ message }) => (
     <div className="bg-blue-100 border-l-4 border-blue-500 text-blue-700 p-4 mb-4 flex items-start">
@@ -301,7 +327,7 @@ const App = () => {
               <LucideIcons.Upload size={48} className="text-gray-400" />
             </div>
           )}
-<p className="text-center mb-4">
+          <p className="text-center mb-4">
             {image ? "새 이미지를 업로드하려면 아래 버튼을 클릭하세요" : "최애의 이미지를 업로드하세요"}
           </p>
           <input
@@ -314,7 +340,7 @@ const App = () => {
           />
           <Button
             onClick={handleNewImageUpload}
-            className="bg-yellow-400 hover:bg-yellow-500 text-purple-700 w-full flex items-center justify-center py-2"
+            className="bg-yellow-400 hover:bg-yellow-500 text-purple-700 w-full flex items-center justify-centerpy-2"
             disabled={isModelLoading || !isModelReady}
           >
             <LucideIcons.Image size={18} className="mr-2" />
