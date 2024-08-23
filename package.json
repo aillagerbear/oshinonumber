@@ -13,6 +13,7 @@
     "autoprefixer": "^10.4.20",
     "crypto-js": "^4.2.0",
     "firebase": "^10.13.0",
+    "framer-motion": "^11.3.29",
     "lucide-react": "^0.428.0",
     "postcss": "^8.4.41",
     "react": "^18.3.1",
